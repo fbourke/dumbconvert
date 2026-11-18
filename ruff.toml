@@ -1,0 +1,11 @@
+# Lint for DumbConvert's own code (NegPy, in vendor/, has its own rules).
+# Run:  .venv/bin/ruff check .
+line-length = 120
+extend-exclude = ["vendor", "build", "dist"]
+
+[lint]
+# E9 syntax errors, F pyflakes (unused or undefined names...), B bugbear (likely bugs)
+select = ["E9", "F", "B"]
+ignore = [
+    "B905",   # zip() without strict=: the app zips sequences of known equal length all the time
+]

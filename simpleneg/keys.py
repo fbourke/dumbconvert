@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 
 from PySide6.QtCore import QRectF, QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
                                QVBoxLayout, QWidget)
 

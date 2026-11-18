@@ -37,9 +37,9 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QIc
                            QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
-    QCompleter, QDoubleSpinBox, QFormLayout, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QListWidget,
+    QCompleter, QDoubleSpinBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget,
-    QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import engine, exif_panel, keys
@@ -1672,8 +1672,9 @@ class PreviewLabel(QLabel):
         self.refresh()
 
     @staticmethod
-    def _largest(k: float, centre: QPointF, area: QRectF = QRectF(0, 0, 1, 1)) -> QRectF:
+    def _largest(k: float, centre: QPointF, area: QRectF | None = None) -> QRectF:
         """The biggest frame of shape `k` (width / height in 0..1 units) inside `area` of the picture."""
+        area = area or QRectF(0, 0, 1, 1)
         w = min(area.width(), area.height() * k)
         h = w / k
         x = min(max(centre.x() - w / 2, area.left()), area.right() - w)

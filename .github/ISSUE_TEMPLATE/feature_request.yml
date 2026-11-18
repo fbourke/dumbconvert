@@ -1,0 +1,15 @@
+name: Idea
+description: Something DumbConvert could do. Let's talk before anyone builds it.
+labels: [idea]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like to do?
+      description: The task you are trying to get done, more than the button you imagine.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: How do you do it today?
