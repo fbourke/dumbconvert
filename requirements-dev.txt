@@ -1,0 +1,2 @@
+# What the tests and the linter need on top of requirements.txt
+ruff==0.17.5

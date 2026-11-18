@@ -81,6 +81,9 @@ python3 -m venv .venv
 
 `./packaging/build.sh` builds the app and its zip into `dist/`.
 
+Want to help? See [CONTRIBUTING.md](CONTRIBUTING.md): how to run the tests, and what makes a pull
+request easy to merge.
+
 ## More
 
 Every key, how it works and why the defaults are what they are: [docs/details.md](docs/details.md).

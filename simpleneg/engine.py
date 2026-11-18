@@ -110,6 +110,10 @@ class Settings:
     # Areas to clean automatically: each a closed shape, ((x, y), ...) in the raw scan like heal_spots.
     # Inside them NegPy's dust and scratch detector runs; the rest of the picture is left alone.
     heal_areas: tuple = ()
+    # Auto crop, once found: the rectangle (0..1, like `crop`) and NegPy's key for the framing it was
+    # found on. Kept so every render (draft, full, export) uses the same crop instead of looking again.
+    auto_rect: tuple | None = None
+    auto_key: str = ""
     # Set automatically, not in the panel
     film: str = "Generic C41"    # crosstalk profile (dye unmix matrix); set from the roll's film stock
     crosstalk: float = 1.0       # 0 = off .. 1 = full matrix. White light mixes the layers: unmix fully
@@ -216,6 +220,11 @@ def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -
             flat["crop_rect"] = st.crop
         elif st.auto_crop:
             flat["crop_from_auto"] = True
+            if st.auto_rect and st.auto_key:
+                # NegPy's frozen auto crop: used while the framing still matches its key
+                # (a turn, a flip or straightening changes the key, and NegPy looks again)
+                flat["crop_rect"] = tuple(st.auto_rect)
+                flat["crop_detect_key"] = st.auto_key
     cfg = WorkspaceConfig.from_flat_dict(flat)
     if path is not None and abs(st.contrast - 1.0) > 1e-6:
         cfg = _with_contrast(cfg, path, st)
@@ -962,6 +971,31 @@ def frame_bounds(path: Path, st: Settings) -> tuple[tuple, tuple, tuple | None]:
                                  prefer_gpu=False, readback_metrics=True)
     b = metrics["log_bounds"]
     return tuple(b.floors), tuple(b.ceils), metrics.get("neutral_axis_refs")
+
+
+def auto_crop_key(st: Settings) -> str:
+    """NegPy's key for everything Auto crop's detection depends on (turn, flip, straightening...)."""
+    from negpy.features.geometry.logic import autocrop_detection_key
+    return autocrop_detection_key(to_config(st).geometry)
+
+
+def find_auto_crop(path: Path, st: Settings, long_edge: int = 1600) -> tuple[tuple, str] | None:
+    """Where Auto crop puts the frame on this scan: (rect in 0..1 of the turned, straightened
+    picture, key of that framing), or None when it finds no border."""
+    trial = st.copy()
+    trial.crop, trial.auto_crop, trial.auto_rect, trial.auto_key = None, True, None, ""
+    cfg = to_config(trial)
+    ip = _processor()
+    src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
+    ip.release_source_cache()
+    step = max(1, int(np.ceil(max(src.shape[:2]) / long_edge)))
+    src = np.ascontiguousarray(src[::step, ::step])
+    _, metrics = ip.run_pipeline(src, cfg, source_hash(path) + "|autocrop", max(src.shape[:2]),
+                                 prefer_gpu=False, readback_metrics=True)
+    found = metrics.get("autocrop_resolved")
+    if found is None or found.rect is None:
+        return None
+    return tuple(float(v) for v in found.rect), found.key
 
 
 def uv_grid(path: Path, st: Settings, long_edge: int = 900) -> np.ndarray:
