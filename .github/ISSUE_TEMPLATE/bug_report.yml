@@ -1,0 +1,33 @@
+name: Bug report
+description: Something does not work as it should
+labels: [bug]
+body:
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options: [macOS (Apple silicon), macOS (Intel), Windows, Linux (Flatpak), Linux (from source)]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: DumbConvert version
+      placeholder: "0.1.0-beta.2"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: scan
+    attributes:
+      label: Your scans
+      description: Camera, light source, film stock, file type (RAW, TIFF...). A link to a sample file helps a lot.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: "Windows: drag `%APPDATA%\\DumbConvert\\dumbconvert.log` here (paste that path into File Explorer's address bar)."

@@ -37,9 +37,9 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QIc
                            QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
-    QCompleter, QDoubleSpinBox, QFormLayout, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QListWidget,
+    QCompleter, QDoubleSpinBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget,
-    QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import engine, exif_panel, keys
@@ -47,6 +47,9 @@ from . import engine, exif_panel, keys
 APP_NAME = "DumbConvert"
 PREVIEW_SIZE = 1600   # long edge of the live preview
 PREVIEW_DRAFT = 800   # while a slider is moving: ~3x faster, replaced by a full render on pause
+# Priority in the worker pool for work someone is waiting for on screen (healing a click, a crop,
+# white balance), ahead of the thumbnails of a roll that is still loading
+URGENT = 2
 THUMB_SIZE = 120     # filmstrip thumbnails: fit in THUMB_SIZE x THUMB_H
 THUMB_H = 80
 
@@ -116,9 +119,11 @@ class Group:
 
 
 # Settings that come from measuring or from the scanning setup, not from editing a frame.
-NOT_EDITS = ("roll_floors", "roll_ceils", "roll_axis", "flat_field", "film", "grayscale")  # from the setup / film stock
+NOT_EDITS = ("roll_floors", "roll_ceils", "roll_axis", "flat_field", "film", "grayscale",  # from the setup / film stock
+             "auto_rect", "auto_key")                                                     # where Auto crop found the frame
 # Settings that stay with one frame when copying settings to other frames.
-PER_FRAME = ("rotation", "fine_rotation", "mirror", "crop", "auto_crop", "analysis_rect", "heal_spots", "heal_areas")
+PER_FRAME = ("rotation", "fine_rotation", "mirror", "crop", "auto_crop", "auto_rect", "auto_key", "analysis_rect",
+             "heal_spots", "heal_areas")
 
 
 def edit_key(st: engine.Settings) -> str:
@@ -145,6 +150,7 @@ class WorkerSignals(QObject):
     roll = Signal(object, object)           # (group, (floors, ceils, outliers) or "ERROR: ...")
     straighten = Signal(object, object)     # (photo, angle | None | "ERROR: ...")
     level = Signal(object, object, bool)    # (photo, angle | None | "ERROR: ...", part of the automatic conversion?)
+    autocrop = Signal(object, object, object)   # (photo, key asked for, (rect, key) | None | "ERROR: ...")
     note = Signal(object, object)           # (photo, a warning about the scan itself, or "")
 
 
@@ -318,6 +324,44 @@ class FadeButton(QPushButton):
         rest = COLORS["muted"] if name in self.QUIET else COLORS["text"]
         lit = COLORS["text"] if name in self.TO_TEXT else ACCENT
         self.setStyleSheet(f"QPushButton:!pressed {{ color: {mix(rest, lit, t)}; }}")
+
+
+# What the system's file browser is called, for "Show in … when done"
+FILE_MANAGER = {"darwin": "Finder", "win32": "Explorer"}.get(sys.platform, "file manager")
+
+
+def show_in_file_manager(path: str):
+    """Open `path` (a folder, or the folder a file is in) in the system's file browser.
+
+    macOS and Windows open a folder URL in Finder / Explorer. On Linux Qt hands it to xdg-open, which
+    a Flatpak sandbox does not have: there the desktop portal is asked to open the folder."""
+    import subprocess
+    if sys.platform.startswith("linux"):
+        if Path("/.flatpak-info").exists():
+            try:
+                from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusUnixFileDescriptor
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    msg = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                                        "org.freedesktop.portal.OpenURI", "OpenDirectory")
+                    msg.setArguments(["", QDBusUnixFileDescriptor(fd), {}])
+                    reply = QDBusConnection.sessionBus().call(msg)
+                    if reply.type() != QDBusMessage.ErrorMessage:
+                        return
+                    print("Show in file manager: the portal said", reply.errorMessage(), file=sys.stderr)
+                finally:
+                    os.close(fd)
+            except Exception as exc:                  # no D-Bus: try the usual way below
+                print("Show in file manager:", exc, file=sys.stderr)
+        else:
+            folder = path if os.path.isdir(path) else os.path.dirname(path)
+            try:
+                subprocess.Popen(["xdg-open", folder], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
 
 def process_alive(pid: int) -> bool:
@@ -1229,6 +1273,30 @@ class ChoiceCard(QFrame):
         self.clicked.emit()
 
 
+class DecimalSpinBox(QDoubleSpinBox):
+    """A number field that takes "." and "," alike as the decimal point.
+
+    Qt only accepts the system's own separator: with a comma region (Italy, most of Europe) a "."
+    typed from the numeric keypad was dropped without a word, and "-2.3" became -2."""
+
+    def _local(self, text: str) -> str:
+        point = self.locale().decimalPoint()
+        other = "," if point == "." else "."
+        return text.replace(other, point)
+
+    def keyPressEvent(self, e):
+        if e.text() in (".", ",") and e.text() != self.locale().decimalPoint():
+            self.lineEdit().insert(self.locale().decimalPoint())
+            return
+        super().keyPressEvent(e)
+
+    def validate(self, text: str, pos: int):
+        return super().validate(self._local(text), pos)        # pasted text too
+
+    def valueFromText(self, text: str) -> float:
+        return super().valueFromText(self._local(text))
+
+
 class LabeledSlider(QWidget):
     """A slider with a name and editable angle (used for Straighten)."""
 
@@ -1239,7 +1307,7 @@ class LabeledSlider(QWidget):
         self.default = default
         self.name = QLabel(name)
         self.name.setToolTip("Double-click to reset")
-        self.value_input = QDoubleSpinBox()
+        self.value_input = DecimalSpinBox()
         self.value_input.setObjectName("straightenAngle")
         self.value_input.setRange(lo, hi)
         self.value_input.setDecimals(1)
@@ -1320,6 +1388,8 @@ class PreviewLabel(QLabel):
         self.setMouseTracking(True)
         self.crop: QRectF | None = None      # normalized 0..1 in the image
         self.ratio: float | None = None      # width / height the frame is held to (None = free)
+        # where a film format's frame may go: the whole picture, or what Auto crop kept (not the border)
+        self.format_area = QRectF(0, 0, 1, 1)
         self._grab: str | None = None        # what is being dragged: "tl" "tr" "bl" "br" or "move"
         self._grab_from: QPointF | None = None
         self._grab_rect: QRectF | None = None
@@ -1342,8 +1412,22 @@ class PreviewLabel(QLabel):
         if pix is not None and pix.height() > 0:
             aspect = pix.width() / pix.height()
             if not draft or not self._aspect or abs(aspect - self._aspect) / self._aspect > 0.01:
-                self._aspect = aspect
+                old, self._aspect = self._aspect, aspect
+                if self.crop_mode and self.ratio and self.crop and old and abs(aspect - old) / old > 0.001:
+                    self._refit_crop()       # a format picked before the whole picture arrived
         self.refresh()
+
+    def _refit_crop(self):
+        """Give the crop frame the held format again on this picture (same centre, same width
+        where it fits): its 0..1 units changed shape with the picture."""
+        k, c = self._k(), self.crop
+        w = c.width()
+        h = w / k
+        if h > 1.0:
+            h, w = 1.0, k
+        x = min(max(c.center().x() - w / 2, 0.0), 1.0 - w)
+        y = min(max(c.center().y() - h / 2, 0.0), 1.0 - h)
+        self.crop = QRectF(x, y, w, h)
 
     # ----- zoom ----------------------------------------------------------------
     MAX_OVER_100 = 2.0                       # zoom in up to 2:1 (200%)
@@ -1571,7 +1655,11 @@ class PreviewLabel(QLabel):
 
     def crop_is_portrait(self) -> bool:
         c = self.crop or QRectF(0, 0, 1, 1)
-        return c.width() * (self._aspect or 1.0) < c.height()
+        a = self._aspect or 1.0
+        shape = c.width() * a / max(c.height(), 1e-6)
+        if abs(shape - 1.0) < 0.03:              # a square frame has no direction: follow the picture's
+            return a < 1.0
+        return shape < 1.0
 
     def set_ratio(self, ratio: float | None):
         """Hold the frame to width / height `ratio` (None = free): the largest such frame the
@@ -1580,16 +1668,17 @@ class PreviewLabel(QLabel):
         self.ratio = ratio
         k = self._k()
         if k and self.crop:
-            self.crop = self._largest(k, self.crop.center())
+            self.crop = self._largest(k, self.crop.center(), self.format_area)
         self.refresh()
 
     @staticmethod
-    def _largest(k: float, centre: QPointF) -> QRectF:
-        """The biggest frame of shape `k` (width / height in 0..1 units) inside the picture."""
-        w = min(1.0, k)
+    def _largest(k: float, centre: QPointF, area: QRectF | None = None) -> QRectF:
+        """The biggest frame of shape `k` (width / height in 0..1 units) inside `area` of the picture."""
+        area = area or QRectF(0, 0, 1, 1)
+        w = min(area.width(), area.height() * k)
         h = w / k
-        x = min(max(centre.x() - w / 2, 0.0), 1.0 - w)
-        y = min(max(centre.y() - h / 2, 0.0), 1.0 - h)
+        x = min(max(centre.x() - w / 2, area.left()), area.right() - w)
+        y = min(max(centre.y() - h / 2, area.top()), area.bottom() - h)
         return QRectF(x, y, w, h)
 
     def _grip_at(self, pos: QPointF) -> str | None:
@@ -1811,7 +1900,7 @@ class ExportDialog(QDialog):
         self.long_edge.setSingleStep(256)
         self.long_edge.setSuffix(" px")
         self.long_edge.setValue(opts.long_edge)
-        self.print_cm = QDoubleSpinBox()
+        self.print_cm = DecimalSpinBox()
         self.print_cm.setRange(5, 300)
         self.print_cm.setSuffix(" cm long side")
         self.print_cm.setValue(opts.print_cm)
@@ -1857,7 +1946,7 @@ class ExportDialog(QDialog):
         dest_row.addWidget(choose)
         form.addRow("Save to", dest_row)
 
-        self.reveal = QCheckBox("Show in Finder when done")
+        self.reveal = QCheckBox(f"Show in {FILE_MANAGER} when done")
         self.reveal.setChecked(extra.get("reveal", True))
         form.addRow("", self.reveal)
 
@@ -1963,7 +2052,7 @@ class ContactSheetDialog(QDialog):
         dest_row.addWidget(self.dest, 1)
         dest_row.addWidget(button("Choose…", self._choose_dest))
         form.addRow("Save to", dest_row)
-        self.reveal = QCheckBox("Show in Finder when done")
+        self.reveal = QCheckBox(f"Show in {FILE_MANAGER} when done")
         self.reveal.setChecked(reveal)
         form.addRow("", self.reveal)
 
@@ -2071,7 +2160,8 @@ class MainWindow(QMainWindow):
         # moment: one full-quality render (and the thumbnails of other selected frames).
         self.render_timer = QTimer(singleShot=True, interval=30)
         self.render_timer.timeout.connect(lambda: self.request_preview(draft=True))
-        self._settle_timer = QTimer(singleShot=True, interval=220)
+        # sharp only once you really stop: switching on every hesitation of a drag looked like a strobe
+        self._settle_timer = QTimer(singleShot=True, interval=450)
         self._settle_timer.timeout.connect(self._settled)
         self._pending_full = False
         self._dirty_thumbs: set = set()
@@ -2114,6 +2204,11 @@ class MainWindow(QMainWindow):
         self._sheets: dict = {}                       # roll -> (reveal in Finder?) while its contact sheet is made
         self.signals.straighten.connect(self.on_straightened)
         self.signals.level.connect(self.on_levelled)
+        self.signals.autocrop.connect(self.on_auto_crop_found)
+        self._autocrop_asked: dict = {}           # photo -> the framing key a search is running for
+        self._levelling: set = set()              # frames whose Auto crop levelling is still being measured
+        self._crop_seed: QRectF | None = None     # the auto crop the crop tool opened on (unchanged = still Auto)
+        self._wb_running = 0                      # white balances still being measured
         self.signals.note.connect(self.on_note)
 
         self._build_ui()
@@ -2258,7 +2353,9 @@ class MainWindow(QMainWindow):
     def _typing(self) -> bool:
         """True while a text field or list (e.g. film stock search) has the keyboard."""
         w = QApplication.focusWidget()
-        return isinstance(w, (QLineEdit, QAbstractSpinBox)) or (w is not None and w.window() is not self)
+        # an editable combo box (film stock) keeps the focus itself and hands the keys to its line edit
+        editable_combo = isinstance(w, QComboBox) and w.isEditable()
+        return isinstance(w, (QLineEdit, QAbstractSpinBox)) or editable_combo or (w is not None and w.window() is not self)
 
     # what ↑ / ↓ mean while each adjust key is held
     ADJUST_HINTS = {"density": ("darker", "lighter"), "cyan": ("more cyan", "more red"),
@@ -3688,6 +3785,7 @@ class MainWindow(QMainWindow):
             s.set_value(getattr(st, key))
         for key, s in self.sliders.items():
             s.set_value(getattr(st, key))
+        self.sliders["color_noise"].setVisible(not st.grayscale)    # B&W has no colour noise to remove
         self.straighten.set_value(st.fine_rotation)
         for cb, val in ((self.autocrop_cb, st.auto_crop),):
             cb.blockSignals(True)
@@ -3846,7 +3944,8 @@ class MainWindow(QMainWindow):
         p, st = self.current, self.current.settings.copy()
         self.auto_straighten_btn.setEnabled(False)
         self.statusBar().showMessage("Measuring the frame edges…")
-        self.pool.start(Job(lambda: engine.auto_straighten(p.path, st), lambda r: self.signals.straighten.emit(p, r)))
+        self.pool.start(Job(lambda: engine.auto_straighten(p.path, st), lambda r: self.signals.straighten.emit(p, r)),
+                        URGENT)
 
     def on_straightened(self, p: Photo, angle):
         self.auto_straighten_btn.setEnabled(True)
@@ -3880,10 +3979,15 @@ class MainWindow(QMainWindow):
         if abs(p.settings.fine_rotation) > 0.05:
             return
         st = p.settings.copy()
-        self.pool.start(Job(lambda: engine.auto_level(p.path, st), lambda r: self.signals.level.emit(p, r, automatic)))
+        self._levelling.add(p)
+        self.pool.start(Job(lambda: engine.auto_level(p.path, st), lambda r: self.signals.level.emit(p, r, automatic)),
+                        URGENT if p is self.current else 0)
 
     def on_levelled(self, p: Photo, angle, automatic: bool):
+        self._levelling.discard(p)
         st = p.settings
+        if p is self.current:
+            self._ensure_auto_crop(p)             # its crop is looked for once the levelling is known
         if isinstance(angle, str) or angle is None or not st.auto_crop or st.crop or abs(st.fine_rotation) > 0.05:
             return                                # nothing to level, or you changed your mind meanwhile
         if p.group is None or p not in p.group.photos:
@@ -3902,6 +4006,51 @@ class MainWindow(QMainWindow):
         else:
             self._commit_history(p)
             self.render_thumb(p)
+
+    # ----- Auto crop, found once ----------------------------------------------
+    # NegPy finds the film border on every render unless the rectangle it found is handed back
+    # with the key of the framing it was found on. Found anew per render, the quick draft (while a
+    # slider moves) and the full render each cropped a little differently, and the picture
+    # twitched; the crop tool also had nothing to start from. A turn, a flip or straightening
+    # changes the key: NegPy then looks again by itself until the new rectangle arrives.
+    def _ensure_auto_crop(self, p: Photo):
+        st = p.settings
+        if not st.auto_crop or st.crop or p in self._levelling:
+            return
+        key = engine.auto_crop_key(st)
+        if (st.auto_rect and st.auto_key == key) or self._autocrop_asked.get(p) == key:
+            return
+        self._autocrop_asked[p] = key
+        snap = st.copy()
+        self.pool.start(Job(lambda: engine.find_auto_crop(p.path, snap),
+                            lambda r: self.signals.autocrop.emit(p, key, r)), URGENT)
+
+    def _auto_crop_rect(self, p: Photo) -> QRectF | None:
+        """The frame's auto crop as a crop-tool rectangle, when it is known for its framing now."""
+        st = p.settings
+        if st.auto_crop and not st.crop and st.auto_rect and st.auto_key == engine.auto_crop_key(st):
+            x0, y0, x1, y1 = st.auto_rect
+            return QRectF(x0, y0, x1 - x0, y1 - y0)
+        return None
+
+    def on_auto_crop_found(self, p: Photo, key: str, result):
+        if self._autocrop_asked.get(p) == key:
+            del self._autocrop_asked[p]
+        st = p.settings
+        if isinstance(result, str) or result is None or not st.auto_crop or st.crop:
+            return                                # no border found (NegPy keeps the whole frame), or Auto went off
+        rect, found_key = result
+        if engine.auto_crop_key(st) != found_key:
+            if p is self.current:
+                self._ensure_auto_crop(p)         # framed differently meanwhile: look again
+            return
+        st.auto_rect, st.auto_key = rect, found_key
+        pv = self.preview
+        if p is self.current and pv.crop_mode and self._crop_seed is not None and pv._grab is None \
+                and pv.crop == self._crop_seed:   # the crop tool opened before it was known: start from it
+            self._crop_seed = pv.crop = self._auto_crop_rect(p)
+            pv.format_area = QRectF(pv.crop)
+            pv.refresh()
 
     def rotate(self, quarter_turns: int):
         """+1 = left (counter-clockwise), -1 = right. The crop box turns with the image."""
@@ -3947,24 +4096,39 @@ class MainWindow(QMainWindow):
 
     # ----- White balance ---------------------------------------------------
     def auto_wb(self):
+        """Balance the frame, and every other selected frame, each on its own picture."""
         if not self.current:
             return
-        p, st = self.current, self.current.settings.copy()
         self.autowb_btn.setEnabled(False)
         self.statusBar().showMessage("Balancing colours…")
-        self.pool.start(Job(lambda: engine.auto_wb(p.path, st), lambda r: self.signals.wb.emit(p, r)))
+        for p in [self.current] + self.selected_others():
+            st = p.settings.copy()
+            self._wb_running += 1
+            self.pool.start(Job(lambda p=p, st=st: engine.auto_wb(p.path, st), lambda r, p=p: self.signals.wb.emit(p, r)),
+                            URGENT if p is self.current else 1)
+
+    def _set_wb_base(self, p: Photo):
+        """A white balance set on the current frame alone must not travel to the selected frames with
+        the next slider move (that copies whatever differs from this base)."""
+        if p is self.current and self._sync_base is not None:
+            for f in ("cyan", "magenta", "yellow"):
+                setattr(self._sync_base, f, getattr(p.settings, f))
 
     def on_wb(self, p: Photo, result):
-        self.autowb_btn.setEnabled(True)
+        self._wb_running = max(0, self._wb_running - 1)
+        if not self._wb_running:
+            self.autowb_btn.setEnabled(True)
         if isinstance(result, str):
             self.statusBar().showMessage(result)
             return
         p.settings.cyan, p.settings.magenta, p.settings.yellow = result
+        self._set_wb_base(p)
         if p is self.current:
             self.load_controls(p.settings)
             self.edited()
         else:
             self._commit_history(p)
+            self.render_thumb(p)
         self.statusBar().showMessage(f"White balance: C {result[0]:.2f}  M {result[1]:.2f}  Y {result[2]:.2f}")
 
     # ----- EXIF ---------------------------------------------------------------
@@ -4193,6 +4357,7 @@ class MainWindow(QMainWindow):
         self.preview.setCursor(Qt.CrossCursor)
         if not on:
             self.preview._update_cursor()
+            self._heal_queue = []                 # clicks still waiting for the map belong to this session
         self.heal_btn.setText("Done Healing" if on else "Heal Dust")
         self.heal_btn.setProperty("on", on)
         self.heal_btn.style().unpolish(self.heal_btn)
@@ -4216,7 +4381,7 @@ class MainWindow(QMainWindow):
             return
         self._uv_busy = True
         st = p.settings.copy()
-        self.pool.start(Job(lambda: engine.uv_grid(p.path, st), lambda r: self.signals.uv.emit(p, key, r)))
+        self.pool.start(Job(lambda: engine.uv_grid(p.path, st), lambda r: self.signals.uv.emit(p, key, r)), URGENT)
 
     def on_uv(self, p: Photo, key, grid):
         self._uv_busy = False
@@ -4306,6 +4471,7 @@ class MainWindow(QMainWindow):
         pv.setCursor(Qt.CrossCursor)
         if not on:
             pv._update_cursor()
+            self._area_queue = []
         self.area_btn.setText("Done Cleaning" if on else "Clean Area")
         self._mark(self.area_btn, on)
         self._tool_lock(on, ("heal_area", "zoom", "escape", "undo", "redo"), self.area_btn)
@@ -4391,7 +4557,7 @@ class MainWindow(QMainWindow):
             return
         p, st, pt = self.current, self.current.settings.copy(), (pos.x(), pos.y())
         self.statusBar().showMessage("Balancing on the spot you clicked…")
-        self.pool.start(Job(lambda: engine.auto_wb(p.path, st, point=pt), lambda r: self.signals.wb.emit(p, r)))
+        self.pool.start(Job(lambda: engine.auto_wb(p.path, st, point=pt), lambda r: self.signals.wb.emit(p, r)), URGENT)
 
     def recalc(self):
         """Measure the film base and white point again, only inside the crop."""
@@ -4405,8 +4571,13 @@ class MainWindow(QMainWindow):
 
     def reset_wb(self):
         if self.current:
+            for p in self.selected_others():      # the selected frames too, like the sliders
+                p.settings.cyan = p.settings.magenta = p.settings.yellow = 1.0
+                self._commit_history(p)
+                self._dirty_thumbs.add(p)
             st = self.current.settings
             st.cyan = st.magenta = st.yellow = 1.0
+            self._set_wb_base(self.current)
             self.load_controls(st)
             self.edited()
 
@@ -4447,7 +4618,7 @@ class MainWindow(QMainWindow):
             w, h = w * scale, h * scale
         else:
             pv.ratio = 1 / pv.ratio
-            pv.crop = pv._largest(pv._k(), c.center())      # as large as the picture allows
+            pv.crop = pv._largest(pv._k(), c.center(), pv.format_area)   # as large as the picture allows
             pv.refresh()
             return
         x = min(max(c.center().x() - w / 2, 0.0), 1.0 - w)
@@ -4457,7 +4628,7 @@ class MainWindow(QMainWindow):
 
     def crop_reset(self):
         if self.preview.crop_mode:
-            self.preview.crop = QRectF(0, 0, 1, 1)
+            self.preview.crop = self.preview.format_area = QRectF(0, 0, 1, 1)   # the border included
             self.set_crop_format("Free")
 
     def _tool_lock(self, on: bool, keys_: tuple = (), keep: QPushButton | None = None):
@@ -4498,6 +4669,13 @@ class MainWindow(QMainWindow):
             pv.crop_mode = True
             c = self.current.settings.crop
             pv.crop = QRectF(c[0], c[1], c[2] - c[0], c[3] - c[1]) if c else QRectF(0, 0, 1, 1)
+            # Auto crop on: start from where it put the frame, not from the whole scan with its border
+            self._crop_seed = None
+            pv.format_area = QRectF(0, 0, 1, 1)
+            if not c and self.current.settings.auto_crop:
+                pv.crop = self._auto_crop_rect(self.current) or QRectF(0, 0, 1, 1)
+                self._crop_seed = pv.format_area = QRectF(pv.crop)
+                self._ensure_auto_crop(self.current)
             self.crop_btn.setText("Apply")
             self.crop_btn.setProperty("go", True)
             self._mark(self.crop_btn, False)
@@ -4517,6 +4695,11 @@ class MainWindow(QMainWindow):
         self._refresh_tips()                      # "Crop the photo", with its key
         self._update_toolbars()
         self.statusBar().clearMessage()
+        seed, self._crop_seed = self._crop_seed, None
+        if apply and seed is not None and pv.crop is not None and self.current.settings.auto_crop and all(
+                abs(a - b) < 0.002 for a, b in zip(pv.crop.getCoords(), seed.getCoords())):
+            self.request_preview()                # opened and applied untouched: it stays Auto
+            return
         if apply:
             r = pv.crop
             whole = r is None or (r.left() < 0.002 and r.top() < 0.002 and r.right() > 0.998 and r.bottom() > 0.998)
@@ -4535,6 +4718,8 @@ class MainWindow(QMainWindow):
     def request_preview(self, draft: bool = False):
         if not self.current:
             return
+        if not draft:
+            self._ensure_auto_crop(self.current)
         if self.preview_busy:          # render the newest settings when this one ends
             self.preview_pending = True
             self._pending_full = self._pending_full or not draft
@@ -4678,7 +4863,7 @@ class MainWindow(QMainWindow):
                 self._export_failed = []
                 box.open()
             if self.export_extra.get("reveal") and done > self._export_errors:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(self._export_dir))
+                show_in_file_manager(self._export_dir)
 
     # ----- Contact sheet (per roll) ----------------------------------------
     def open_contact_sheet(self, g: Group | None = None):
@@ -4746,7 +4931,7 @@ class MainWindow(QMainWindow):
         n = len(result)
         self.statusBar().showMessage(f"Contact sheet of {g.name}: {n} sheet{'s' if n > 1 else ''} → {result[0].parent}")
         if reveal:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(result[0] if n == 1 else result[0].parent)))
+            show_in_file_manager(str(result[0] if n == 1 else result[0].parent))
 
 
 # The look: a grey window with black, borderless sections; neon light blue for anything chosen.
@@ -4962,6 +5147,26 @@ def self_test(path: str) -> int:
     return 0
 
 
+def _log_without_console():
+    """Started without a console (Windows runs the app with pythonw), errors had nowhere to go and
+    were lost. They go to dumbconvert.log next to the recovery file instead, so a tester can send it.
+    The previous run's log is kept as dumbconvert.old.log."""
+    if sys.stderr is not None and sys.stdout is not None:
+        return
+    try:
+        log = MainWindow._recovery_path().with_name("dumbconvert.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists():
+            log.replace(log.with_name("dumbconvert.old.log"))
+        f = open(log, "w", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    from . import __version__
+    print(f"{APP_NAME} {__version__} on {sys.platform}, Python {sys.version.split()[0]}", file=f)
+    sys.stdout = sys.stdout or f
+    sys.stderr = sys.stderr or f
+
+
 def main():
     import os
     if os.environ.get("DUMBCONVERT_SELFTEST") and len(sys.argv) > 1:
@@ -4979,6 +5184,7 @@ def main():
             pass                          # could not restart: carry on as before
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    _log_without_console()
     # The system UI font: San Francisco on a Mac. It is used from macOS, never shipped with the app.
     from PySide6.QtGui import QFontDatabase
     ui = QFontDatabase.systemFont(QFontDatabase.GeneralFont)

@@ -16,7 +16,7 @@ import json
 import urllib.parse
 import urllib.request
 
-from PySide6.QtCore import (QDate, QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSettings, QStringListModel,
+from PySide6.QtCore import (QDate, QEvent, QObject, QPoint, QPointF, QRunnable, QSettings, QStringListModel,
                             Qt, QThreadPool, QTimer, Signal)
 from PySide6.QtGui import QAction, QColor, QIcon, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QComboBox, QCompleter, QDateEdit, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
