@@ -2,7 +2,7 @@
 
 import unittest
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QLocale, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -33,6 +33,19 @@ class StraightenTest(unittest.TestCase):
         self.assertEqual(self.control.value(), -2.3)
         self.assertEqual(self.control.slider.value(), -23)
         self.assertEqual(self.changes, [-2.3])
+
+    def test_dot_and_comma_both_work_in_any_region(self):
+        # Comma regions (Italy, most of Europe) and dot regions (US, UK) alike
+        for region in ("it_IT", "de_DE", "en_US", "en_GB"):
+            for typed in ("-2.3", "-2,3"):
+                with self.subTest(region=region, typed=typed):
+                    self.control.value_input.setLocale(QLocale(region))
+                    self.control.set_value(0.0)
+                    editor = self.control.value_input.lineEdit()
+                    editor.selectAll()
+                    QTest.keyClicks(editor, typed)
+                    QTest.keyClick(editor, Qt.Key_Return)
+                    self.assertEqual(self.control.value(), -2.3)
 
     def test_arrows_step_by_one_tenth(self):
         QTest.keyClick(self.control.value_input, Qt.Key_Up)
